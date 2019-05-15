@@ -75,6 +75,7 @@ my $pgCtlTimeout = undef;
 my $connectionTimeout = 5000;
 my $useMitmproxy = 0;
 my $mitmFifoPath = catfile("tmp_check", "mitmproxy.fifo");
+my $testAutoExplain = 1;
 
 my $serversAreShutdown = "TRUE";
 my $usingWindows = 0;
@@ -291,6 +292,11 @@ push(@pgOptions, '-c', "fsync=off");
 
 my $sharedPreloadLibraries = "citus";
 
+if ($testAutoExplain)
+{
+    $sharedPreloadLibraries .= ',auto_explain';
+}
+
 # check if pg_stat_statements extension is installed
 # if it is add it to shared preload libraries
 my $sharedir = `$pgConfig --sharedir`;
@@ -322,6 +328,13 @@ push(@pgOptions, '-c', "citus.task_tracker_delay=10ms");
 push(@pgOptions, '-c', "citus.remote_task_check_interval=1ms");
 push(@pgOptions, '-c', "citus.shard_replication_factor=2");
 push(@pgOptions, '-c', "citus.node_connection_timeout=${connectionTimeout}");
+
+# auto_explain options for the tests
+if ($testAutoExplain)
+{
+    push(@pgOptions, '-c', "auto_explain.log_min_duration=0");
+    push(@pgOptions, '-c', "auto_explain.log_analyze=true");
+}
 
 if ($useMitmproxy)
 {
