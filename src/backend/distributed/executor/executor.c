@@ -2240,6 +2240,9 @@ PlacementExecutionReady(TaskPlacementExecution *placementExecution)
 			}
 		}
 	}
+
+	/* update the state to ready for further processing */
+	placementExecution->executionState = PLACEMENT_EXECUTION_READY;
 }
 
 
