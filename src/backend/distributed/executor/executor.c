@@ -480,16 +480,46 @@ CreateDistributedExecution(DistributedPlan *distributedPlan,
 
 
 /*
- * StartDistributedExecution opens connections for distributed execution and
- * assigns each task with shard placements that have previously been modified
- * in the current transaction to the connection that modified them.
+ * StartDistributedExecution takes the steps required to safely do a distributed
+ * execution:
+ *
+ * 1. Take necessary executor locks
+ * 2. Determine whether the transaction needs rollback, 2PC
+ * 3. Record whether a relation is accessed over multiple connections
+ * 4. Assign tasks to connections that modified the shards in the current transaction
  */
 void
 StartDistributedExecution(DistributedExecution *execution)
 {
 	DistributedPlan *distributedPlan = execution->plan;
+	CmdType operation = distributedPlan->operation;
 	Job *job = distributedPlan->workerJob;
 	List *taskList = job->taskList;
+
+	if (operation == CMD_INSERT || operation == CMD_UPDATE || operation == CMD_DELETE)
+	{
+		/*
+		 * We prevent concurrent modifications of shards in two cases:
+		 * 1. Any non-commutative writes to a replicated table
+		 * 2. Multi-shard writes that are executed in parallel
+		 *
+		 * The first case ensures we do not apply updates in different orders on
+		 * different replicas (e.g. of a reference table), which could lead the
+		 * replicas to diverge.
+		 *
+		 * The second case prevents deadlocks due to out-of-order execution.
+		 */ 
+		if (list_length(taskList) == 1)
+		{
+			Task *task = (Task *) linitial(taskList);
+
+			AcquireExecutorShardLock(task, distributedPlan->operation);
+		}
+		else if (list_length(taskList) > 1)
+		{
+			AcquireExecutorMultiShardLocks(taskList);
+		}
+	}
 
 	if (MultiShardCommitProtocol != COMMIT_PROTOCOL_BARE)
 	{
