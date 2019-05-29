@@ -323,8 +323,6 @@ static DistributedExecution * CreateDistributedExecution(DistributedPlan *distri
 static void StartDistributedExecution(DistributedExecution *execution);
 static void RunDistributedExecution(DistributedExecution *execution);
 static bool ShouldRunTasksSequentially(DistributedExecution *execution);
-static DistributedPlan * CreateSingleTaskDistributedPlan(Task *task,
-														 DistributedPlan *originalPlan);
 static void SequentialRunDistributedExecution(DistributedExecution *execution);
 static void FinishDistributedExecution(DistributedExecution *execution);
 
@@ -504,9 +502,10 @@ CreateDistributedExecution(DistributedPlan *distributedPlan,
 
 
 /*
- * StartDistributedExecution opens connections for distributed execution and
- * assigns each task with shard placements that have previously been modified
- * in the current transaction to the connection that modified them.
+ * StartDistributedExecution sets up the coordinated transaction and 2PC for
+ * the execution whenever necessary. It also keeps track of parallel relation
+ * accesses to enforce restrictions that arise due to foreign keys to reference
+ * tables.
  */
 void
 StartDistributedExecution(DistributedExecution *execution)
@@ -1034,6 +1033,19 @@ ShouldRunTasksSequentially(DistributedExecution *execution)
 	initialTask = (Task *) linitial(taskList);
 	if (initialTask->rowValuesLists != NIL)
 	{
+		/*
+		 * We explicitly assert the fields to be NULL because we implemented the
+		 * single task plan executions for a restricted set of operations, e.g.,
+		 * only multi-row inserts. So, we don't expect other plans go through this
+		 * code, unless execution is implemented properly.
+		 */
+		Assert (plan->operation == CMD_INSERT);
+		Assert (plan->subPlanList == NIL);
+		Assert (plan->insertSelectSubquery == NULL);
+		Assert (plan->insertTargetList == NIL);
+		Assert (plan->intermediateResultIdPrefix == NULL);
+		Assert (plan->masterQuery == NULL);
+
 		/* found a multi-row INSERT */
 		return true;
 	}
@@ -1055,44 +1067,35 @@ SequentialRunDistributedExecution(DistributedExecution *execution)
 	Job *job = distributedPlan->workerJob;
 	List *taskList = job->taskList;
 
-	int unfinishedTaskCount = execution->unfinishedTaskCount;
-	int taskIndex = 0;
+	ListCell *taskCell = NULL;
 
-	Assert(list_length(taskList) == unfinishedTaskCount);
-
-	for (taskIndex = 0; taskIndex < unfinishedTaskCount; ++taskIndex)
+	foreach(taskCell, taskList)
 	{
-		DistributedExecution *singleTaskExecution = palloc0(sizeof(DistributedExecution));
+		Task *taskToExecute = (Task *) lfirst(taskCell);
+		DistributedPlan *singleTaskDistributedPlan = copyObject(distributedPlan);
 
-		Task *taskToExecute = (Task *) list_nth(taskList, taskIndex);
-		DistributedPlan *singleTaskDistributedPlan =
-			CreateSingleTaskDistributedPlan(taskToExecute, distributedPlan);
+		DistributedExecution *singleTaskExecution = NULL;
+		int targetPoolSize = 1;
+
+		singleTaskDistributedPlan->workerJob->taskList = list_make1(taskToExecute);
+
+		singleTaskExecution =
+			CreateDistributedExecution(singleTaskDistributedPlan, execution->scanState,
+									   targetPoolSize);
 
 		/*
-		 * Use some fields as the same which are safe to and required to
-		 * share across single task executions.
+		 * Use some fields as the same which are safe to share across executions
+		 * and required to to have across single task executions.
 		 */
-		singleTaskExecution->raiseInterrupts = execution->raiseInterrupts;
 		singleTaskExecution->isTransaction = execution->isTransaction;
 		singleTaskExecution->executionStats = execution->executionStats;
-		singleTaskExecution->scanState = execution->scanState;
-
-		/* we only expect to use a single connection for a single task */
-		singleTaskExecution->targetPoolSize = 1;
-		singleTaskExecution->unfinishedTaskCount = 1;
-		singleTaskExecution->totalTaskCount = 1;
-
-		/* RunDistributedExecution() will set the sessions, be explict here */
-		singleTaskExecution->sessionList = NIL;
-		singleTaskExecution->waitEventSet = NULL;
-
-		/* we're going to execute a single task only */
-		singleTaskExecution->plan = singleTaskDistributedPlan;
 
 		/*
-		 * StartDistributedExecution is common for all the executions (including
+		 * StartDistributedExecution() is common for all the executions (including
 		 * the parent execution) and so we don't need to re-call it for each
-		 * individual singleTaskExecution execution here.
+		 * individual singleTaskExecution execution here. Also, note that we've
+		 * already set isTransaction field in the singleTaskExecution, which
+		 * depends on the execution.
 		 */
 
 		/* simply call the regular execution function */
@@ -1107,49 +1110,12 @@ SequentialRunDistributedExecution(DistributedExecution *execution)
 
 
 /*
- * CreateSingleTaskDistributedPlan gets a task and a distributed plan. The
- * function returns a newly allocated distributed plan where the new plan
- * contains only the task that is provided to the function along with
- * some of the necessary fields set.
- */
-static DistributedPlan *
-CreateSingleTaskDistributedPlan(Task *task, DistributedPlan *originalPlan)
-{
-	DistributedPlan *singleTaskPlan = palloc0(sizeof(DistributedPlan));
-
-	/* only copy the necessary parts for a single task execution */
-	singleTaskPlan->workerJob = copyObject(originalPlan->workerJob);
-	singleTaskPlan->workerJob->taskList = list_make1(task);
-
-	singleTaskPlan->operation = originalPlan->operation;
-	singleTaskPlan->hasReturning = originalPlan->hasReturning;
-	singleTaskPlan->targetRelationId = originalPlan->targetRelationId;
-
-	/* shallow copy of relationIdList is good enough */
-	singleTaskPlan->relationIdList = list_copy(originalPlan->relationIdList);
-
-	/*
-	 * We explicitly assert the fields to be NULL because we implemented the single task
-	 * plans for a restricted set of operations (see ShouldRunTasksSequentially()).
-	 * So, we don't expect other plans go through this code, unless implemented properly.
-	 */
-	Assert (singleTaskPlan->operation == CMD_INSERT);
-	Assert (singleTaskPlan->subPlanList == NIL);
-	Assert (singleTaskPlan->insertSelectSubquery == NULL);
-	Assert (singleTaskPlan->insertTargetList == NIL);
-	Assert (singleTaskPlan->intermediateResultIdPrefix == NULL);
-	Assert (singleTaskPlan->masterQuery == NULL);
-	Assert (list_length(originalPlan->workerJob->taskList) > 1);
-
-	return singleTaskPlan;
-}
-
-
-
-/*
- * RunDistributedExecution runs a distributed execution to completion. It
- * creates a wait event set to listen for events on any of the connections
- * and runs the connection state machine when a connection has an event.
+ * RunDistributedExecution runs a distributed execution to completion. It first opens
+ * connections for distributed execution and assigns each task with shard placements
+ * that have previously been modified in the current transaction to the connection
+ * that modified them. Then, it creates a wait event set to listen for events on
+ * any of the connections and runs the connection state machine when a connection
+ * has an event.
  */
 void
 RunDistributedExecution(DistributedExecution *execution)
