@@ -540,6 +540,14 @@ StartDistributedExecution(DistributedExecution *execution)
 			}
 		}
 	}
+	else
+	{
+		/*
+		 * We prefer to error on any failures for CREATE INDEX
+		 * CONCURRENTLY or VACUUM//VACUUM ANALYZE.
+		 */
+		execution->errorOnAnyFailure = true;
+	}
 
 	execution->isTransaction = InCoordinatedTransaction();
 
@@ -590,11 +598,11 @@ DistributedPlanModifiesDatabase(DistributedPlan *plan)
 	}
 
 	firstTask = (Task *) linitial(taskList);
-	if (firstTask->taskType == DDL_TASK || firstTask->taskType == MODIFY_TASK)
+	if (!ReadOnlyTask(firstTask->taskType))
 	{
 		return true;
 	}
-	else if (firstTask->taskType == ROUTER_TASK || firstTask->taskType == SQL_TASK)
+	else
 	{
 		/*
 		 * TODO: We currently do not execute modifying CTEs via ROUTER_TASK/SQL_TASK.
@@ -1481,7 +1489,7 @@ ConnectionStateMachine(WorkerSession *session)
 
 /*
  * TransactionModifiedDistributedTable returns true if the current transaction already
- * executed a command which modified the at least one distributed table in the current
+ * executed a command which modified at least one distributed table in the current
  * transaction.
  */
 static bool
