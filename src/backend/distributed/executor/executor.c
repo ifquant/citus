@@ -173,6 +173,8 @@ typedef struct WorkerPool
 	 */
 	dlist_head readyTaskQueue;
 	int readyTaskCount;
+
+	TimestampTz poolCreationTime;
 } WorkerPool;
 
 struct TaskPlacementExecution;
@@ -1033,6 +1035,7 @@ FindOrCreateWorkerPool(DistributedExecution *execution, WorkerNode *workerNode)
 	workerPool = (WorkerPool *) palloc0(sizeof(WorkerPool));
 	workerPool->node = workerNode;
 	workerPool->distributedExecution = execution;
+	workerPool->poolCreationTime = GetCurrentTimestamp();
 	dlist_init(&workerPool->pendingTaskQueue);
 	dlist_init(&workerPool->readyTaskQueue);
 
@@ -1095,6 +1098,8 @@ FindOrCreateWorkerSession(WorkerPool *workerPool, MultiConnection *connection)
 void
 RunDistributedExecution(DistributedExecution *execution)
 {
+	const TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+															 NodeConnectionTimeout);
 	int workerCount = list_length(execution->workerList);
 
 	/* additional 2 is for postmaster and latch */
@@ -1111,7 +1116,7 @@ RunDistributedExecution(DistributedExecution *execution)
 
 		while (execution->unfinishedTaskCount > 0 && !cancellationReceived)
 		{
-			long timeout = 1000;
+			long timeout = DeadlineTimestampTzToTimeout(deadline);
 			int connectionCount = list_length(execution->sessionList);
 			int eventCount = 0;
 			int eventIndex = 0;
@@ -1232,6 +1237,22 @@ ManageWorkerPool(WorkerPool *workerPool)
 
 	/* we should never have less than 0 connections ever */
 	Assert (activeConnectionCount >= 0 && idleConnectionCount >= 0);
+
+	TimestampTz poolCreationTime = workerPool->poolCreationTime;
+	TimestampTz now = GetCurrentTimestamp();
+
+	if (activeConnectionCount == 0 &&
+		TimestampDifferenceExceeds(poolCreationTime, now, NodeConnectionTimeout))
+	{
+			/*
+			 * We've tried more than NodeConnectionTimeout to have at least one
+			 * active connection to the worker node.
+			 */
+			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
+							errmsg("could not establish any connections to the node "
+								   "%s:%d after %u ms",workerPool-> node->workerName,
+								   workerPool-> node->workerPort, NodeConnectionTimeout)));
+	}
 
 	if (failedConnectionCount >= 1)
 	{

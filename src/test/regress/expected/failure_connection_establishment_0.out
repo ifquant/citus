@@ -88,13 +88,13 @@ SET citus.task_assignment_policy TO 'round-robin';
 -- test would be if one of the queries does not return the result but an error.
 SET client_min_messages TO ERROR;
 SELECT name FROM r1 WHERE id = 2;
+ERROR:  could not establish any connections to the node localhost:9060 after 400 ms
+SELECT name FROM r1 WHERE id = 2;
  name 
 ------
  bar
 (1 row)
 
-SELECT name FROM r1 WHERE id = 2;
-ERROR:  could not establish any connections to the node localhost:9060 after 400 ms
 -- verify a connection attempt was made to the intercepted node, this would have cause the
 -- connection to have been delayed and thus caused a timeout
 SELECT citus.dump_network_traffic();
