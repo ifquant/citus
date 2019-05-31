@@ -54,6 +54,12 @@ typedef enum
 	COMMIT_PROTOCOL_2PC = 2
 } CommitProtocolType;
 
+typedef struct SubXactState
+{
+	SubTransactionId subId;
+	StringInfo setLocalCmd;
+} SubXactState;
+
 /*
  * GUC that determines whether a SELECT in a transaction block should also run in
  * a transaction block on the worker.
@@ -102,6 +108,7 @@ extern void InitializeTransactionManagement(void);
 
 /* other functions */
 extern List * ActiveSubXacts(void);
+extern List * ActiveSubXactStates(void);
 
 
 #endif /*  TRANSACTION_MANAGMENT_H */

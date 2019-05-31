@@ -51,11 +51,6 @@ StringInfo activeSetStmts;
 
 static List *activeSubXactStates = NIL;
 
-typedef struct SubXactState {
-	SubTransactionId subId;
-	StringInfo setLocalCmd;
-} SubXactState;
-
 /* some pre-allocated memory so we don't need to call malloc() during callbacks */
 MemoryContext CommitContext = NULL;
 
@@ -528,6 +523,27 @@ ActiveSubXacts(void)
 	}
 
 	return activeSubXactsReversed;
+}
+
+
+/* ActiveSubXacts returns list of active sub-transactions in temporal order. */
+List *
+ActiveSubXactStates(void)
+{
+	ListCell *subXactCell = NULL;
+	List *reversedSubXactStates = NIL;
+
+	/*
+	 * activeSubXacts is in reversed temporal order, so we reverse it to get it
+	 * in temporal order.
+	 */
+	foreach(subXactCell, activeSubXactStates)
+	{
+		SubXactState *state = lfirst(subXactCell);
+		reversedSubXactStates = lcons(state, reversedSubXactStates);
+	}
+
+	return reversedSubXactStates;
 }
 
 

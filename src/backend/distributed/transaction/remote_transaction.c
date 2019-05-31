@@ -93,21 +93,28 @@ StartRemoteTransactionBegin(struct MultiConnection *connection)
 					 distributedTransactionId->transactionNumber,
 					 timestamp);
 
-	if (activeSetStmts != NULL)
-	{
-		appendStringInfoString(beginAndSetDistributedTransactionId, activeSetStmts->data);
-	}
 
 	/* append in-progress savepoints for this transaction */
-	activeSubXacts = ActiveSubXacts();
+	activeSubXacts = ActiveSubXactStates();
 	transaction->lastSuccessfulSubXact = TopSubTransactionId;
 	transaction->lastQueuedSubXact = TopSubTransactionId;
 	foreach(subIdCell, activeSubXacts)
 	{
-		SubTransactionId subId = lfirst_int(subIdCell);
+		SubXactState *subXactState = lfirst(subIdCell);
+		if (subXactState->setLocalCmd != NULL)
+		{
+			appendStringInfoString(beginAndSetDistributedTransactionId,
+								   subXactState->setLocalCmd->data);
+		}
+
 		appendStringInfo(beginAndSetDistributedTransactionId,
-						 "SAVEPOINT savepoint_%u;", subId);
-		transaction->lastQueuedSubXact = subId;
+						 "SAVEPOINT savepoint_%u;", subXactState->subId);
+		transaction->lastQueuedSubXact = subXactState->subId;
+	}
+
+	if (activeSetStmts != NULL)
+	{
+		appendStringInfoString(beginAndSetDistributedTransactionId, activeSetStmts->data);
 	}
 
 	if (!SendRemoteCommand(connection, beginAndSetDistributedTransactionId->data))
@@ -1235,7 +1242,6 @@ FinishRemoteTransactionSavepointRollback(MultiConnection *connection, SubTransac
 	{
 		HandleRemoteTransactionResultError(connection, result, raiseErrors);
 	}
-
 	/* ROLLBACK TO SAVEPOINT succeeded, check if it recovers the transaction */
 	else if (transaction->transactionRecovering)
 	{
