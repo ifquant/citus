@@ -93,6 +93,11 @@ StartRemoteTransactionBegin(struct MultiConnection *connection)
 					 distributedTransactionId->transactionNumber,
 					 timestamp);
 
+	if (activeSetStmts != NULL)
+	{
+		appendStringInfoString(beginAndSetDistributedTransactionId, activeSetStmts->data);
+	}
+
 	/* append in-progress savepoints for this transaction */
 	activeSubXacts = ActiveSubXacts();
 	transaction->lastSuccessfulSubXact = TopSubTransactionId;

@@ -176,6 +176,20 @@ multi_ProcessUtility(PlannedStmt *pstmt,
 	}
 #endif
 
+	if (IsA(parsetree, VariableSetStmt))
+	{
+		VariableSetStmt *setStmt = (VariableSetStmt *) parsetree;
+
+		/* we don't process anything other than SET LOCAL */
+		/* need to be in a transaction to propagate SET LOCAL */
+		if (setStmt->is_local && IsMultiStatementTransaction())
+		{
+			ProcessVariableSetStmt(setStmt, queryString);
+		}
+
+		/* TODO: warn if not possible to propagate? */
+	}
+
 	/*
 	 * TRANSMIT used to be separate command, but to avoid patching the grammar
 	 * it's no overlaid onto COPY, but with FORMAT = 'transmit' instead of the

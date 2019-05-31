@@ -238,7 +238,7 @@ SET search_path = 'multi_real_time_transaction';
 
 -- FIXME: make this work
 BEGIN;
-SET LOCAL app.allow_access TO TRUE;
+SET LOCAL app.show_rows TO TRUE;
 SELECT COUNT(*) FROM test_table;
 COMMIT;
 

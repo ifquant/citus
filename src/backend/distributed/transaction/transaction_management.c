@@ -46,8 +46,15 @@ XactModificationType XactModificationLevel = XACT_MODIFICATION_NONE;
 /* list of connections that are part of the current coordinated transaction */
 dlist_head InProgressTransactions = DLIST_STATIC_INIT(InProgressTransactions);
 
-/* stack of active sub-transactions */
-static List *activeSubXacts = NIL;
+
+StringInfo activeSetStmts;
+
+static List *activeSubXactStates = NIL;
+
+typedef struct SubXactState {
+	SubTransactionId subId;
+	StringInfo setLocalCmd;
+} SubXactState;
 
 /* some pre-allocated memory so we don't need to call malloc() during callbacks */
 MemoryContext CommitContext = NULL;
@@ -67,6 +74,7 @@ int FunctionCallLevel = 0;
 
 
 /* transaction management functions */
+static void BeginCoordinatedTransaction(void);
 static void CoordinatedTransactionCallback(XactEvent event, void *arg);
 static void CoordinatedSubTransactionCallback(SubXactEvent event, SubTransactionId subId,
 											  SubTransactionId parentSubid, void *arg);
@@ -76,25 +84,6 @@ static void AdjustMaxPreparedTransactions(void);
 static void PushSubXact(SubTransactionId subId);
 static void PopSubXact(SubTransactionId subId);
 static void SwallowErrors(void (*func)());
-
-
-/*
- * BeginCoordinatedTransaction begins a coordinated transaction. No
- * pre-existing coordinated transaction may be in progress.
- */
-void
-BeginCoordinatedTransaction(void)
-{
-	if (CurrentCoordinatedTransactionState != COORD_TRANS_NONE &&
-		CurrentCoordinatedTransactionState != COORD_TRANS_IDLE)
-	{
-		ereport(ERROR, (errmsg("starting transaction in wrong state")));
-	}
-
-	CurrentCoordinatedTransactionState = COORD_TRANS_STARTED;
-
-	AssignDistributedTransactionId();
-}
 
 
 /*
@@ -157,6 +146,25 @@ InitializeTransactionManagement(void)
 
 
 /*
+ * BeginCoordinatedTransaction begins a coordinated transaction. No
+ * pre-existing coordinated transaction may be in progress./
+ */
+static void
+BeginCoordinatedTransaction(void)
+{
+	if (CurrentCoordinatedTransactionState != COORD_TRANS_NONE &&
+		CurrentCoordinatedTransactionState != COORD_TRANS_IDLE)
+	{
+		ereport(ERROR, (errmsg("starting transaction in wrong state")));
+	}
+
+	CurrentCoordinatedTransactionState = COORD_TRANS_STARTED;
+
+	AssignDistributedTransactionId();
+}
+
+
+/*
  * Transaction management callback, handling coordinated transaction, and
  * transaction independent connection management.
  *
@@ -212,6 +220,7 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			CurrentCoordinatedTransactionState = COORD_TRANS_NONE;
 			XactModificationLevel = XACT_MODIFICATION_NONE;
 			dlist_init(&InProgressTransactions);
+			activeSetStmts = NULL;
 			CoordinatedTransactionUses2PC = false;
 
 			UnSetDistributedTransactionId();
@@ -264,6 +273,7 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			CurrentCoordinatedTransactionState = COORD_TRANS_NONE;
 			XactModificationLevel = XACT_MODIFICATION_NONE;
 			dlist_init(&InProgressTransactions);
+			activeSetStmts = NULL;
 			CoordinatedTransactionUses2PC = false;
 			FunctionCallLevel = 0;
 
@@ -473,7 +483,14 @@ static void
 PushSubXact(SubTransactionId subId)
 {
 	MemoryContext old_context = MemoryContextSwitchTo(CurTransactionContext);
-	activeSubXacts = lcons_int(subId, activeSubXacts);
+
+	SubXactState *state = palloc(sizeof(SubXactState));
+	state->subId = subId;
+	state->setLocalCmd = activeSetStmts;
+
+	activeSubXactStates = lcons(state, activeSubXactStates);
+	activeSetStmts = makeStringInfo();
+
 	MemoryContextSwitchTo(old_context);
 }
 
@@ -483,8 +500,12 @@ static void
 PopSubXact(SubTransactionId subId)
 {
 	MemoryContext old_context = MemoryContextSwitchTo(CurTransactionContext);
-	Assert(linitial_int(activeSubXacts) == subId);
-	activeSubXacts = list_delete_first(activeSubXacts);
+	SubXactState *state = linitial(activeSubXactStates);
+
+	Assert(state->subId == subId);
+	activeSetStmts = state->setLocalCmd;
+	activeSubXactStates = list_delete_first(activeSubXactStates);
+
 	MemoryContextSwitchTo(old_context);
 }
 
@@ -493,17 +514,17 @@ PopSubXact(SubTransactionId subId)
 List *
 ActiveSubXacts(void)
 {
-	ListCell *subIdCell = NULL;
+	ListCell *subXactCell = NULL;
 	List *activeSubXactsReversed = NIL;
 
 	/*
 	 * activeSubXacts is in reversed temporal order, so we reverse it to get it
 	 * in temporal order.
 	 */
-	foreach(subIdCell, activeSubXacts)
+	foreach(subXactCell, activeSubXactStates)
 	{
-		SubTransactionId subId = lfirst_int(subIdCell);
-		activeSubXactsReversed = lcons_int(subId, activeSubXactsReversed);
+		SubXactState *state = lfirst(subXactCell);
+		activeSubXactsReversed = lcons_int(state->subId, activeSubXactsReversed);
 	}
 
 	return activeSubXactsReversed;

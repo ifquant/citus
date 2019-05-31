@@ -10,6 +10,7 @@
 #define TRANSACTION_MANAGMENT_H
 
 #include "lib/ilist.h"
+#include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
 
 /* describes what kind of modifications have occurred in the current transaction */
@@ -85,11 +86,12 @@ extern int StoredProcedureLevel;
 /* number of nested function call levels we are currently in */
 extern int FunctionCallLevel;
 
+/* SET LOCAL statements active in the current (sub-)transaction. */
+extern StringInfo activeSetStmts;
 
 /*
  * Coordinated transaction management.
  */
-extern void BeginCoordinatedTransaction(void);
 extern void BeginOrContinueCoordinatedTransaction(void);
 extern bool InCoordinatedTransaction(void);
 extern void CoordinatedTransactionUse2PC(void);
