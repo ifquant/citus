@@ -236,9 +236,24 @@ CREATE POLICY hide_by_default ON test_table_1610000 TO PUBLIC
 SET ROLE rls_user;
 SET search_path = 'multi_real_time_transaction';
 
--- FIXME: make this work
+-- shouldn't see all rows because of RLS
+SELECT COUNT(*) FROM test_table;
+
 BEGIN;
 SET LOCAL app.show_rows TO TRUE;
+SELECT COUNT(*) FROM test_table;
+
+SAVEPOINT disable_rls;
+SET LOCAL app.show_rows TO FALSE;
+SELECT COUNT(*) FROM test_table;
+
+ROLLBACK TO SAVEPOINT disable_rls;
+SELECT COUNT(*) FROM test_table;
+
+SAVEPOINT disable_rls_for_real;
+SET LOCAL app.show_rows TO FALSE;
+RELEASE SAVEPOINT disable_rls_for_real;
+
 SELECT COUNT(*) FROM test_table;
 COMMIT;
 
