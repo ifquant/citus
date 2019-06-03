@@ -322,9 +322,12 @@ static DistributedExecution * CreateDistributedExecution(DistributedPlan *distri
 														 int targetPoolSize);
 static void StartDistributedExecution(DistributedExecution *execution);
 static void RunDistributedExecution(DistributedExecution *execution);
-static bool ShouldRunTasksSequentially(DistributedExecution *execution);
+static bool ShouldRunTasksSequentially(DistributedPlan *plan);
 static void SequentialRunDistributedExecution(DistributedExecution *execution);
+static DistributedPlan * CreateSingleTaskDistributedPlanForTask(DistributedPlan *plan,
+																Task *task);
 static void FinishDistributedExecution(DistributedExecution *execution);
+static void AfterExecutionSessionHandling(List *sessionList);
 
 static bool DistributedStatementRequiresRollback(DistributedPlan *distributedPlan);
 static void AssignTasksToConnections(DistributedExecution *execution);
@@ -406,7 +409,7 @@ CitusExecScan(CustomScanState *node)
 
 		StartDistributedExecution(execution);
 
-		if (ShouldRunTasksSequentially(execution))
+		if (ShouldRunTasksSequentially(execution->plan))
 		{
 			SequentialRunDistributedExecution(execution);
 		}
@@ -593,16 +596,37 @@ DistributedStatementRequiresRollback(DistributedPlan *distributedPlan)
  * distributed execution. In particular, it releases connections and
  * clears their state.
  */
-void
+static void
 FinishDistributedExecution(DistributedExecution *execution)
 {
 	DistributedPlan *distributedPlan = execution->plan;
+
+	UnsetCitusNoticeLevel();
+
+	AfterExecutionSessionHandling(execution->sessionList);
+
+	if (distributedPlan->operation != CMD_SELECT)
+	{
+		/* prevent copying shards in same transaction */
+		XactModificationLevel = XACT_MODIFICATION_DATA;
+	}
+}
+
+
+/*
+ * AfterExecutionSessionHandling does any clean-up necessary for the session
+ * used during the execution.
+ */
+static void
+AfterExecutionSessionHandling(List *sessionList)
+{
 	ListCell *sessionCell = NULL;
 
 	/* always trigger wait event set in the first round */
-	foreach(sessionCell, execution->sessionList)
+	foreach(sessionCell, sessionList)
 	{
 		WorkerSession *session = lfirst(sessionCell);
+
 		MultiConnection *connection = session->connection;
 		RemoteTransaction *transaction = &(connection->remoteTransaction);
 		RemoteTransactionState transactionState = transaction->transactionState;
@@ -629,15 +653,8 @@ FinishDistributedExecution(DistributedExecution *execution)
 
 		/* TODO: can we be in SENT_COMMAND? */
 	}
-
-	UnsetCitusNoticeLevel();
-
-	if (distributedPlan->operation != CMD_SELECT)
-	{
-		/* prevent copying shards in same transaction */
-		XactModificationLevel = XACT_MODIFICATION_DATA;
-	}
 }
+
 
 
 /*
@@ -1016,9 +1033,8 @@ FindOrCreateWorkerSession(WorkerPool *workerPool, MultiConnection *connection)
  * a distributed deadlock when the upserts touch the same rows.
  */
 static bool
-ShouldRunTasksSequentially(DistributedExecution *execution)
+ShouldRunTasksSequentially(DistributedPlan *plan)
 {
-	DistributedPlan *plan = execution->plan;
 	Job *workerJob = plan->workerJob;
 	List *taskList = workerJob->taskList;
 	Task *initialTask = NULL;
@@ -1045,6 +1061,7 @@ ShouldRunTasksSequentially(DistributedExecution *execution)
 		Assert (plan->insertTargetList == NIL);
 		Assert (plan->intermediateResultIdPrefix == NULL);
 		Assert (plan->masterQuery == NULL);
+		Assert (workerJob->dependedJobList == NIL);
 
 		/* found a multi-row INSERT */
 		return true;
@@ -1072,7 +1089,8 @@ SequentialRunDistributedExecution(DistributedExecution *execution)
 	foreach(taskCell, taskList)
 	{
 		Task *taskToExecute = (Task *) lfirst(taskCell);
-		DistributedPlan *singleTaskDistributedPlan = copyObject(distributedPlan);
+		DistributedPlan *singleTaskDistributedPlan =
+			CreateSingleTaskDistributedPlanForTask(distributedPlan, taskToExecute);
 
 		DistributedExecution *singleTaskExecution = NULL;
 		int targetPoolSize = 1;
@@ -1104,8 +1122,48 @@ SequentialRunDistributedExecution(DistributedExecution *execution)
 		/* remember the total number of rows processed */
 		execution->rowsProcessed += singleTaskExecution->rowsProcessed;
 
-		FinishDistributedExecution(singleTaskExecution);
+		/* clean-up anything if needed */
+		AfterExecutionSessionHandling(singleTaskExecution->sessionList);
 	}
+}
+
+
+/*
+ * CreateSingleTaskDistributedPlanForTask returns a newly allocated distributed plan
+ * with a single task which is passed to the function.
+ *
+ * This function is only intended (and asserted) for tasks that needs to be executed
+ * one task at a time (see ShouldRunTasksSequentially()).
+ */
+static DistributedPlan *
+CreateSingleTaskDistributedPlanForTask(DistributedPlan *plan, Task *task)
+{
+	DistributedPlan *singleTaskPlan = (DistributedPlan *) palloc(sizeof(DistributedPlan));
+
+	/*
+	 * This function is only intended for copying plans that require sequential
+	 * task execution. So, it does not copy all the fields of the plan.
+	 */
+	Assert (ShouldRunTasksSequentially(plan));
+
+	/* we only copy the necessary parts of the plan */
+	singleTaskPlan->operation = plan->operation;
+	singleTaskPlan->targetRelationId = plan->targetRelationId;
+	singleTaskPlan->hasReturning = plan->hasReturning;
+	singleTaskPlan->relationIdList = list_copy(plan->relationIdList);
+
+	/* finally set the task list */
+	singleTaskPlan->workerJob = (Job *) palloc0(sizeof(Job));
+
+	/*
+	 * We don't care about Job's requiresMasterEvaluation,
+	 * deferredPruning and partitionKeyValue fields at this
+	 * point because they are used in BeginCustomScan(),
+	 * where we're already in ExecCustomScan().
+	  */
+	singleTaskPlan->workerJob->taskList = list_make1(task);
+
+	return singleTaskPlan;
 }
 
 
