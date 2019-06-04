@@ -1248,10 +1248,19 @@ ManageWorkerPool(WorkerPool *workerPool)
 			 * We've tried more than NodeConnectionTimeout to have at least one
 			 * active connection to the worker node.
 			 */
-			ereport(ERROR, (errcode(ERRCODE_CONNECTION_FAILURE),
-							errmsg("could not establish any connections to the node "
-								   "%s:%d after %u ms",workerPool-> node->workerName,
-								   workerPool-> node->workerPort, NodeConnectionTimeout)));
+			ereport(WARNING, (errcode(ERRCODE_CONNECTION_FAILURE),
+							  errmsg("could not establish any connections to the node "
+									 "%s:%d after %u ms",workerPool-> node->workerName,
+									 workerPool-> node->workerPort,
+									 NodeConnectionTimeout)));
+
+			/*
+			 * Fail the pool and create an oppurtuneaty to execute tasks over
+			 * other pools when tasks have more than one placement to execute.
+			 */
+			WorkerPoolFailed(workerPool);
+
+			return;
 	}
 
 	if (failedConnectionCount >= 1)
