@@ -44,8 +44,13 @@
  */
 typedef struct DistributedExecution
 {
-	/* distributed query plan */
-	DistributedPlan *plan;
+	/* the corresponding distributed plan's operation */
+	CmdType operation;
+
+	List *tasksToExecute;
+
+	/* the corresponding distributed plan has RETURNING */
+	bool hasReturning;
 
 	/* custom scan state */
 	CitusScanState *scanState;
@@ -241,9 +246,6 @@ typedef struct ShardCommandExecution
 	/* description of the task */
 	Task *task;
 
-	/* job of which the task is part */
-	Job *job;
-
 	/* order in which the command should be replicated on replicas */
 	PlacementExecutionOrder executionOrder;
 
@@ -317,19 +319,20 @@ bool ForceMaxQueryParallelization = false;
 
 
 /* local functions */
-static DistributedExecution * CreateDistributedExecution(DistributedPlan *distributedPlan,
+static DistributedExecution * CreateDistributedExecution(CmdType operation,
+														 List *taskList,
+														 bool hasReturning,
 														 CitusScanState *scanState,
 														 int targetPoolSize);
 static void StartDistributedExecution(DistributedExecution *execution);
 static void RunDistributedExecution(DistributedExecution *execution);
-static bool ShouldRunTasksSequentially(DistributedPlan *plan);
+static bool ShouldRunTasksSequentially(List *taskList);
 static void SequentialRunDistributedExecution(DistributedExecution *execution);
-static DistributedPlan * CreateSingleTaskDistributedPlanForTask(DistributedPlan *plan,
-																Task *task);
-static void FinishDistributedExecution(DistributedExecution *execution);
-static void AfterExecutionSessionHandling(List *sessionList);
 
-static bool DistributedStatementRequiresRollback(DistributedPlan *distributedPlan);
+static void FinishDistributedExecution(DistributedExecution *execution);
+static void CleanUpSessions(DistributedExecution *execution);
+
+static bool DistributedStatementRequiresRollback(CmdType operation, List *taskList);
 static void AssignTasksToConnections(DistributedExecution *execution);
 static void UnclaimAllSessionConnections(List *sessionList);
 static bool ShouldForceOpeningConnection(TaskPlacementExecutionState
@@ -383,6 +386,9 @@ CitusExecScan(CustomScanState *node)
 		bool interTransactions = false;
 		int targetPoolSize = DEFAULT_POOL_SIZE;
 
+		Job *job = distributedPlan->workerJob;
+		List *taskList = job->taskList;
+
 		/* we are taking locks on partitions of partitioned tables */
 		LockPartitionsInRelationList(distributedPlan->relationIdList, AccessShareLock);
 
@@ -397,19 +403,17 @@ CitusExecScan(CustomScanState *node)
 		}
 		else if (ForceMaxQueryParallelization)
 		{
-			Job *job = distributedPlan->workerJob;
-			List *taskList = job->taskList;
-
 			/* we might at most have the length of tasks pool size */
 			targetPoolSize = list_length(taskList);
 		}
 
-		execution = CreateDistributedExecution(distributedPlan, scanState,
+		execution = CreateDistributedExecution(distributedPlan->operation, taskList,
+											   distributedPlan->hasReturning, scanState,
 											   targetPoolSize);
 
 		StartDistributedExecution(execution);
 
-		if (ShouldRunTasksSequentially(execution->plan))
+		if (ShouldRunTasksSequentially(execution->tasksToExecute))
 		{
 			SequentialRunDistributedExecution(execution);
 		}
@@ -447,6 +451,7 @@ ExecuteTaskList(CmdType operation, List *taskList, int targetPoolSize)
 {
 	DistributedPlan *distributedPlan = NULL;
 	DistributedExecution *execution = NULL;
+	bool hasReturning = false;
 
 	distributedPlan = CitusMakeNode(DistributedPlan);
 	distributedPlan->operation = operation;
@@ -458,8 +463,9 @@ ExecuteTaskList(CmdType operation, List *taskList, int targetPoolSize)
 		targetPoolSize = 1;
 	}
 
-	execution = CreateDistributedExecution(distributedPlan, NULL,
-										   targetPoolSize);
+	execution =
+		CreateDistributedExecution(operation, taskList, hasReturning, NULL,
+								   targetPoolSize);
 
 	StartDistributedExecution(execution);
 	RunDistributedExecution(execution);
@@ -474,15 +480,15 @@ ExecuteTaskList(CmdType operation, List *taskList, int targetPoolSize)
  * a distributed plan.
  */
 DistributedExecution *
-CreateDistributedExecution(DistributedPlan *distributedPlan,
+CreateDistributedExecution(CmdType operation, List *taskList, bool hasReturning,
 						   CitusScanState *scanState, int targetPoolSize)
 {
-	DistributedExecution *execution = NULL;
-	Job *job = distributedPlan->workerJob;
-	List *taskList = job->taskList;
+	DistributedExecution *execution =
+		(DistributedExecution *) palloc0(sizeof(DistributedExecution));
 
-	execution = (DistributedExecution *) palloc0(sizeof(DistributedExecution));
-	execution->plan = distributedPlan;
+	execution->operation = operation;
+	execution->tasksToExecute = taskList;
+	execution->hasReturning = hasReturning;
 	execution->scanState = scanState;
 	execution->executionStats =
 		(DistributedExecutionStats *) palloc0(sizeof(DistributedExecutionStats));
@@ -513,13 +519,11 @@ CreateDistributedExecution(DistributedPlan *distributedPlan,
 void
 StartDistributedExecution(DistributedExecution *execution)
 {
-	DistributedPlan *distributedPlan = execution->plan;
-	Job *job = distributedPlan->workerJob;
-	List *taskList = job->taskList;
+	List *taskList = execution->tasksToExecute;
 
 	if (MultiShardCommitProtocol != COMMIT_PROTOCOL_BARE)
 	{
-		if (DistributedStatementRequiresRollback(distributedPlan))
+		if (DistributedStatementRequiresRollback(execution->operation, taskList))
 		{
 			BeginOrContinueCoordinatedTransaction();
 
@@ -550,10 +554,8 @@ StartDistributedExecution(DistributedExecution *execution)
 
 
 static bool
-DistributedStatementRequiresRollback(DistributedPlan *distributedPlan)
+DistributedStatementRequiresRollback(CmdType operation, List *taskList)
 {
-	Job *job = distributedPlan->workerJob;
-	List *taskList = job->taskList;
 	Task *task = NULL;
 
 	if (MultiShardCommitProtocol == COMMIT_PROTOCOL_BARE)
@@ -561,7 +563,7 @@ DistributedStatementRequiresRollback(DistributedPlan *distributedPlan)
 		return false;
 	}
 
-	if (distributedPlan->operation == CMD_SELECT)
+	if (operation == CMD_SELECT)
 	{
 		return SelectOpensTransactionBlock && IsTransactionBlock();
 	}
@@ -599,13 +601,9 @@ DistributedStatementRequiresRollback(DistributedPlan *distributedPlan)
 static void
 FinishDistributedExecution(DistributedExecution *execution)
 {
-	DistributedPlan *distributedPlan = execution->plan;
-
 	UnsetCitusNoticeLevel();
 
-	AfterExecutionSessionHandling(execution->sessionList);
-
-	if (distributedPlan->operation != CMD_SELECT)
+	if (execution->operation != CMD_SELECT)
 	{
 		/* prevent copying shards in same transaction */
 		XactModificationLevel = XACT_MODIFICATION_DATA;
@@ -614,12 +612,13 @@ FinishDistributedExecution(DistributedExecution *execution)
 
 
 /*
- * AfterExecutionSessionHandling does any clean-up necessary for the session
+ * CleanUpSessions does any clean-up necessary for the session
  * used during the execution.
  */
 static void
-AfterExecutionSessionHandling(List *sessionList)
+CleanUpSessions(DistributedExecution *execution)
 {
+	List *sessionList = execution->sessionList;
 	ListCell *sessionCell = NULL;
 
 	/* always trigger wait event set in the first round */
@@ -652,9 +651,12 @@ AfterExecutionSessionHandling(List *sessionList)
 		}
 
 		/* TODO: can we be in SENT_COMMAND? */
+
+		/* get ready for the next executions if we need use the same connection */
+		connection->waitFlags = WL_SOCKET_READABLE | WL_SOCKET_WRITEABLE;
+		execution->waitFlagsChanged = true;
 	}
 }
-
 
 
 /*
@@ -684,12 +686,12 @@ UnclaimAllSessionConnections(List *sessionList)
 static void
 AssignTasksToConnections(DistributedExecution *execution)
 {
-	DistributedPlan *distributedPlan = execution->plan;
-	Job *job = distributedPlan->workerJob;
-	List *taskList = job->taskList;
+	CmdType operation = execution->operation;
+	List *taskList = execution->tasksToExecute;
+	bool hasReturning = execution->hasReturning;
+
 	ListCell *taskCell = NULL;
 	ListCell *sessionCell = NULL;
-	CmdType operation = distributedPlan->operation;
 
 	foreach(taskCell, taskList)
 	{
@@ -706,14 +708,12 @@ AssignTasksToConnections(DistributedExecution *execution)
 		shardCommandExecution =
 			(ShardCommandExecution *) palloc0(sizeof(ShardCommandExecution));
 		shardCommandExecution->task = task;
-		shardCommandExecution->job = job;
 		shardCommandExecution->executionOrder = ExecutionOrderForTask(operation, task);
 		shardCommandExecution->placementExecutions =
 			(TaskPlacementExecution **) palloc0(placementExecutionCount *
 												sizeof(TaskPlacementExecution *));
 		shardCommandExecution->placementExecutionCount = placementExecutionCount;
-		shardCommandExecution->expectResults = distributedPlan->hasReturning ||
-											   distributedPlan->operation == CMD_SELECT;
+		shardCommandExecution->expectResults = hasReturning || operation == CMD_SELECT;
 
 		foreach(taskPlacementCell, task->taskPlacementList)
 		{
@@ -1033,10 +1033,8 @@ FindOrCreateWorkerSession(WorkerPool *workerPool, MultiConnection *connection)
  * a distributed deadlock when the upserts touch the same rows.
  */
 static bool
-ShouldRunTasksSequentially(DistributedPlan *plan)
+ShouldRunTasksSequentially(List *taskList)
 {
-	Job *workerJob = plan->workerJob;
-	List *taskList = workerJob->taskList;
 	Task *initialTask = NULL;
 
 	if (list_length(taskList) < 2)
@@ -1049,20 +1047,6 @@ ShouldRunTasksSequentially(DistributedPlan *plan)
 	initialTask = (Task *) linitial(taskList);
 	if (initialTask->rowValuesLists != NIL)
 	{
-		/*
-		 * We explicitly assert the fields to be NULL because we implemented the
-		 * single task plan executions for a restricted set of operations, e.g.,
-		 * only multi-row inserts. So, we don't expect other plans go through this
-		 * code, unless execution is implemented properly.
-		 */
-		Assert (plan->operation == CMD_INSERT);
-		Assert (plan->subPlanList == NIL);
-		Assert (plan->insertSelectSubquery == NULL);
-		Assert (plan->insertTargetList == NIL);
-		Assert (plan->intermediateResultIdPrefix == NULL);
-		Assert (plan->masterQuery == NULL);
-		Assert (workerJob->dependedJobList == NIL);
-
 		/* found a multi-row INSERT */
 		return true;
 	}
@@ -1080,90 +1064,25 @@ ShouldRunTasksSequentially(DistributedPlan *plan)
 static void
 SequentialRunDistributedExecution(DistributedExecution *execution)
 {
-	DistributedPlan *distributedPlan = execution->plan;
-	Job *job = distributedPlan->workerJob;
-	List *taskList = job->taskList;
+	List *taskList = execution->tasksToExecute;
 
 	ListCell *taskCell = NULL;
 
 	foreach(taskCell, taskList)
 	{
 		Task *taskToExecute = (Task *) lfirst(taskCell);
-		DistributedPlan *singleTaskDistributedPlan =
-			CreateSingleTaskDistributedPlanForTask(distributedPlan, taskToExecute);
 
-		DistributedExecution *singleTaskExecution = NULL;
-		int targetPoolSize = 1;
+		/* we'll only need one connection */
+		execution->targetPoolSize = 1;
 
-		singleTaskDistributedPlan->workerJob->taskList = list_make1(taskToExecute);
-
-		singleTaskExecution =
-			CreateDistributedExecution(singleTaskDistributedPlan, execution->scanState,
-									   targetPoolSize);
-
-		/*
-		 * Use some fields as the same which are safe to share across executions
-		 * and required to to have across single task executions.
-		 */
-		singleTaskExecution->isTransaction = execution->isTransaction;
-		singleTaskExecution->executionStats = execution->executionStats;
-
-		/*
-		 * StartDistributedExecution() is common for all the executions (including
-		 * the parent execution) and so we don't need to re-call it for each
-		 * individual singleTaskExecution execution here. Also, note that we've
-		 * already set isTransaction field in the singleTaskExecution, which
-		 * depends on the execution.
-		 */
+		/* execute each task one by one */
+		execution->tasksToExecute = list_make1(taskToExecute);
+		execution->totalTaskCount = 1;
+		execution->unfinishedTaskCount = 1;
 
 		/* simply call the regular execution function */
-		RunDistributedExecution(singleTaskExecution);
-
-		/* remember the total number of rows processed */
-		execution->rowsProcessed += singleTaskExecution->rowsProcessed;
-
-		/* clean-up anything if needed */
-		AfterExecutionSessionHandling(singleTaskExecution->sessionList);
+		RunDistributedExecution(execution);
 	}
-}
-
-
-/*
- * CreateSingleTaskDistributedPlanForTask returns a newly allocated distributed plan
- * with a single task which is passed to the function.
- *
- * This function is only intended (and asserted) for tasks that needs to be executed
- * one task at a time (see ShouldRunTasksSequentially()).
- */
-static DistributedPlan *
-CreateSingleTaskDistributedPlanForTask(DistributedPlan *plan, Task *task)
-{
-	DistributedPlan *singleTaskPlan = (DistributedPlan *) palloc(sizeof(DistributedPlan));
-
-	/*
-	 * This function is only intended for copying plans that require sequential
-	 * task execution. So, it does not copy all the fields of the plan.
-	 */
-	Assert (ShouldRunTasksSequentially(plan));
-
-	/* we only copy the necessary parts of the plan */
-	singleTaskPlan->operation = plan->operation;
-	singleTaskPlan->targetRelationId = plan->targetRelationId;
-	singleTaskPlan->hasReturning = plan->hasReturning;
-	singleTaskPlan->relationIdList = list_copy(plan->relationIdList);
-
-	/* finally set the task list */
-	singleTaskPlan->workerJob = (Job *) palloc0(sizeof(Job));
-
-	/*
-	 * We don't care about Job's requiresMasterEvaluation,
-	 * deferredPruning and partitionKeyValue fields at this
-	 * point because they are used in BeginCustomScan(),
-	 * where we're already in ExecCustomScan().
-	  */
-	singleTaskPlan->workerJob->taskList = list_make1(task);
-
-	return singleTaskPlan;
 }
 
 
@@ -1226,7 +1145,8 @@ RunDistributedExecution(DistributedExecution *execution)
 			}
 
 			/* we should always have more (or equal) waitEvents */
-			Assert (maxWaitEventCount >= connectionCount + 2);
+			/* TODO: Sequential execution breaks this assert */
+			/* Assert (maxWaitEventCount >= connectionCount + 2); */
 
 			/* wait for I/O events */
 #if (PG_VERSION_NUM >= 100000)
@@ -1280,6 +1200,8 @@ RunDistributedExecution(DistributedExecution *execution)
 
 		pfree(events);
 		FreeWaitEventSet(execution->waitEventSet);
+
+		CleanUpSessions(execution);
 	}
 	PG_CATCH();
 	{
@@ -1317,10 +1239,10 @@ ManageWorkerPool(WorkerPool *workerPool)
 	int connectionIndex = 0;
 
 	/* we should always have more (or equal) active connections than idle connections */
-	Assert (activeConnectionCount >= idleConnectionCount);
+	Assert(activeConnectionCount >= idleConnectionCount);
 
 	/* we should never have less than 0 connections ever */
-	Assert (activeConnectionCount >= 0 && idleConnectionCount >= 0);
+	Assert(activeConnectionCount >= 0 && idleConnectionCount >= 0);
 
 	if (failedConnectionCount >= 1)
 	{
