@@ -17,6 +17,7 @@
 #include "access/xact.h"
 #include "commands/dbcommands.h"
 #include "distributed/citus_custom_scan.h"
+#include "distributed/commands/multi_copy.h"
 #include "distributed/connection_management.h"
 #include "distributed/multi_client_executor.h"
 #include "distributed/multi_executor.h"
@@ -1708,7 +1709,14 @@ StartPlacementExecutionOnSession(TaskPlacementExecution *placementExecution,
 	/* connection is going to be in use */
 	workerPool->idleConnectionCount--;
 
-	if (paramListInfo != NULL)
+
+	if (task->copyTask)
+	{
+		uint64 shardId = taskPlacement->shardId;
+		ExecuteCopyTask(connection, task->copyReceiver, shardId, task->copyData);
+		querySent = true;
+	}
+	else if (paramListInfo != NULL)
 	{
 		int parameterCount = paramListInfo->numParams;
 		Oid *parameterTypes = NULL;
@@ -1733,11 +1741,14 @@ StartPlacementExecutionOnSession(TaskPlacementExecution *placementExecution,
 		return false;
 	}
 
-	singleRowMode = PQsetSingleRowMode(connection->pgConn);
-	if (singleRowMode == 0)
+	if (!task->copyTask)
 	{
-		connection->connectionState = MULTI_CONNECTION_LOST;
-		return false;
+		singleRowMode = PQsetSingleRowMode(connection->pgConn);
+		if (singleRowMode == 0)
+		{
+			connection->connectionState = MULTI_CONNECTION_LOST;
+			return false;
+		}
 	}
 
 	session->currentTask = placementExecution;
