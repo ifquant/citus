@@ -1,3 +1,5 @@
+--
+-- failure_connection_establishment.sql tests some behaviour of connection management when
 -- it fails to connect.
 --
 -- Failure cases covered:
