@@ -1375,7 +1375,7 @@ CheckConnectionTimeout(WorkerPool *workerPool)
 	if (activeConnectionCount < requiredActiveConnectionCount && tasksReadyToExecute &&
 		TimestampDifferenceExceeds(firstTaskAssignmentTime, now, NodeConnectionTimeout))
 	{
-		int logLevel = execution->errorOnAnyFailure ? ERROR : WARNING;
+		int logLevel = WARNING;
 
 		/*
 		 * First fail the pool and create an opportunity to execute tasks
