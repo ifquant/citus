@@ -174,7 +174,7 @@ typedef struct WorkerPool
 	dlist_head readyTaskQueue;
 	int readyTaskCount;
 
-	TimestampTz poolCreationTime;
+	TimestampTz firstTaskAssignmentTime;
 } WorkerPool;
 
 struct TaskPlacementExecution;
@@ -345,6 +345,7 @@ static WorkerPool * FindOrCreateWorkerPool(DistributedExecution *execution,
 static WorkerSession * FindOrCreateWorkerSession(WorkerPool *workerPool,
 												 MultiConnection *connection);
 static void ManageWorkerPool(WorkerPool *workerPool);
+static void CheckConnectionTimeout(WorkerPool *workerPool);
 static WaitEventSet * BuildWaitEventSet(List *sessionList);
 static void UpdateWaitEventSetFlags(WaitEventSet *waitEventSet, List *sessionList);
 static TaskPlacementExecution * PopPlacementExecution(WorkerSession *session);
@@ -863,6 +864,13 @@ AssignTasksToConnections(DistributedExecution *execution)
 				elog(DEBUG4, "%s:%d has an assigned task", connection->hostname,
 					 connection->port);
 
+				/*
+				 * We'll assign tasks almost at the same time, in the loop right now.
+				 * So, it is acceptable to have a tiny difference between the first and
+				 * the last assignments.
+				 */
+				workerPool->firstTaskAssignmentTime = GetCurrentTimestamp();
+
 				placementExecution->assignedSession = session;
 
 				/* if executed, this task placement must use this session */
@@ -890,6 +898,17 @@ AssignTasksToConnections(DistributedExecution *execution)
 					/* task is ready to execute on any session */
 					dlist_push_tail(&workerPool->readyTaskQueue,
 									&placementExecution->workerReadyQueueNode);
+
+					/*
+					 * Record the first task assignment time to the pool. We need this
+					 * to enforce NodeConnectionTimeout.
+					 */
+					if (workerPool->activeConnectionCount == 0 &&
+						workerPool->readyTaskCount == 0)
+					{
+						workerPool->firstTaskAssignmentTime = GetCurrentTimestamp();
+					}
+
 					workerPool->readyTaskCount++;
 				}
 				else
@@ -1035,7 +1054,6 @@ FindOrCreateWorkerPool(DistributedExecution *execution, WorkerNode *workerNode)
 	workerPool = (WorkerPool *) palloc0(sizeof(WorkerPool));
 	workerPool->node = workerNode;
 	workerPool->distributedExecution = execution;
-	workerPool->poolCreationTime = GetCurrentTimestamp();
 	dlist_init(&workerPool->pendingTaskQueue);
 	dlist_init(&workerPool->readyTaskQueue);
 
@@ -1238,30 +1256,8 @@ ManageWorkerPool(WorkerPool *workerPool)
 	/* we should never have less than 0 connections ever */
 	Assert (activeConnectionCount >= 0 && idleConnectionCount >= 0);
 
-	TimestampTz poolCreationTime = workerPool->poolCreationTime;
-	TimestampTz now = GetCurrentTimestamp();
-
-	if (activeConnectionCount == 0 &&
-		TimestampDifferenceExceeds(poolCreationTime, now, NodeConnectionTimeout))
-	{
-			/*
-			 * We've tried more than NodeConnectionTimeout to have at least one
-			 * active connection to the worker node.
-			 */
-			ereport(WARNING, (errcode(ERRCODE_CONNECTION_FAILURE),
-							  errmsg("could not establish any connections to the node "
-									 "%s:%d after %u ms",workerPool-> node->workerName,
-									 workerPool-> node->workerPort,
-									 NodeConnectionTimeout)));
-
-			/*
-			 * Fail the pool and create an oppurtuneaty to execute tasks over
-			 * other pools when tasks have more than one placement to execute.
-			 */
-			WorkerPoolFailed(workerPool);
-
-			return;
-	}
+	/* we might fail the execution or warn the user about connection timeouts */
+	CheckConnectionTimeout(workerPool);
 
 	if (failedConnectionCount >= 1)
 	{
@@ -1328,6 +1324,75 @@ ManageWorkerPool(WorkerPool *workerPool)
 	{
 		execution->connectionSetChanged = true;
 	}
+}
+
+
+/*
+ * CheckConnectionTimeout makes sure that the execution enforces the connection
+ * establishment timeout defined by the user (NodeConnectionTimeout).
+ *
+ * The rule is that if a worker pool has already ready tasks but no active connections
+ * at all, take an action. For the types of actions, see the comments in the function.
+ *
+ * Enforcing the timeout per pool (over per session) helps the execution to continue
+ * even if we can establish a single connection as we expect to have target pool size
+ * number of connections. In the end, the executor is capable of using one connection
+ * to execute multiple tasks.
+ */
+static void
+CheckConnectionTimeout(WorkerPool *workerPool)
+{
+	DistributedExecution *execution = workerPool->distributedExecution;
+	TimestampTz firstTaskAssignmentTime = workerPool->firstTaskAssignmentTime;
+	TimestampTz now = GetCurrentTimestamp();
+
+	int activeConnectionCount = workerPool->activeConnectionCount;
+	int readyTaskCount = workerPool->readyTaskCount;
+
+	int requiredActiveConnectionCount = 1;
+	bool tasksReadyToExecute = readyTaskCount > 0;
+
+	/*
+	 * This is a special case where we assign tasks to sessions even before
+	 * the connections are established. So, make sure to apply similar
+	 * restrictions. In this case, make sure that we get all the connections
+	 * established.
+	 */
+	if (ForceMaxQueryParallelization)
+	{
+		requiredActiveConnectionCount = list_length(workerPool->sessionList);
+		tasksReadyToExecute = true;
+	}
+
+	/*
+	 * When there are already ready tasks and no active connection, enforce
+	 * NodeConnectionTimeout.
+	 *
+	 * The enforcement is not always erroring out. For example, if a SELECT task
+	 * has two different placements, we'd warn the user and continue with the next
+	 * placement.
+	 */
+	if (activeConnectionCount < requiredActiveConnectionCount && tasksReadyToExecute &&
+		TimestampDifferenceExceeds(firstTaskAssignmentTime, now, NodeConnectionTimeout))
+	{
+		int logLevel = execution->errorOnAnyFailure ? ERROR : WARNING;
+
+		/*
+		 * First fail the pool and create an opportunity to execute tasks
+		 * over other pools when tasks have more than one placement to execute.
+		 */
+		WorkerPoolFailed(workerPool);
+
+		logLevel = execution->errorOnAnyFailure || execution->failed ? ERROR : WARNING;
+
+		ereport(logLevel, (errcode(ERRCODE_CONNECTION_FAILURE),
+						   errmsg("could not establish any connections to the node "
+								  "%s:%d after %u ms",workerPool-> node->workerName,
+								  workerPool-> node->workerPort,
+								  NodeConnectionTimeout)));
+
+	}
+
 }
 
 
@@ -2425,6 +2490,15 @@ PlacementExecutionReady(TaskPlacementExecution *placementExecution)
 			/* add to ready-to-start task queue */
 			dlist_push_tail(&workerPool->readyTaskQueue,
 							&placementExecution->workerReadyQueueNode);
+		}
+
+		/*
+		 * Record the first task assignment time to the pool. We need this
+		 * to enforce NodeConnectionTimeout.
+		*/
+		if (workerPool->activeConnectionCount == 0 && workerPool->readyTaskCount == 0)
+		{
+			workerPool->firstTaskAssignmentTime = GetCurrentTimestamp();
 		}
 
 		workerPool->readyTaskCount++;

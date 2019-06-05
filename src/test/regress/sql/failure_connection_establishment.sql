@@ -1,5 +1,3 @@
---
--- failure_connection_establishment.sql tests some behaviour of connection management when
 -- it fails to connect.
 --
 -- Failure cases covered:
@@ -54,13 +52,13 @@ SELECT citus.mitmproxy('conn.delay(500)');
 
 -- we cannot control which replica of the reference table will be queried and there is
 -- only one specific client we can control the connection for.
--- by using round-robin task_assignment_policy we can force to hit both machines. We will
--- use two output files to match both orders to verify there is 1 that times out and falls
--- through to read from the other machine
+-- by using round-robin task_assignment_policy we can force to hit both machines. 
+-- and in the end, dumping the network traffic shows that the connection establishment
+-- is initiated to the node behind the proxy
+SET client_min_messages TO ERROR;
 SET citus.task_assignment_policy TO 'round-robin';
 -- suppress the warning since we can't control which shard is chose first. Failure of this
 -- test would be if one of the queries does not return the result but an error.
-SET client_min_messages TO ERROR;
 SELECT name FROM r1 WHERE id = 2;
 SELECT name FROM r1 WHERE id = 2;
 
@@ -68,6 +66,34 @@ SELECT name FROM r1 WHERE id = 2;
 -- connection to have been delayed and thus caused a timeout
 SELECT citus.dump_network_traffic();
 
+SELECT citus.mitmproxy('conn.allow()');
+
+-- similar test with the above but this time on a 
+-- distributed table instead of a reference table
+-- and with citus.force_max_query_parallelization is set
+SET citus.force_max_query_parallelization TO ON;
+SELECT citus.mitmproxy('conn.delay(500)');
+-- suppress the warning since we can't control which shard is chose first. Failure of this
+-- test would be if one of the queries does not return the result but an error.
+SELECT count(*) FROM products;
+SELECT count(*) FROM products;
+
+-- use OFFSET 1 to prevent printing the line where source 
+-- is the worker
+SELECT citus.dump_network_traffic() ORDER BY 1 OFFSET 1;
+
+SELECT citus.mitmproxy('conn.allow()');
+SET citus.shard_replication_factor TO 1;
+CREATE TABLE single_replicatated(key int);
+SELECT create_distributed_table('single_replicatated', 'key');
+
+-- this time the table is single replicated and we're still using the
+-- the max parallelization flag, so the query should fail
+SET citus.force_max_query_parallelization TO ON;
+SELECT citus.mitmproxy('conn.delay(500)');
+SELECT count(*) FROM single_replicatated;
+
+SET citus.force_max_query_parallelization TO OFF;
 RESET client_min_messages;
 
 -- verify get_global_active_transactions works when a timeout happens on a connection
