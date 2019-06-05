@@ -3099,6 +3099,11 @@ ExecuteCopyTask(MultiConnection *connection, CitusCopyDestReceiver *copyDest,
 }
 
 
+/*
+ * CreateShardCopyDataHash constructs a hash table which maps from shard
+ * identifier to a ShardCopyData struct, passing the provided MemoryContext to
+ * hash_create for hash allocations.
+ */
 static HTAB *
 CreateShardCopyDataHash(MemoryContext memoryContext)
 {
@@ -3117,6 +3122,12 @@ CreateShardCopyDataHash(MemoryContext memoryContext)
 	return shardCopyDataHash;
 }
 
+
+/*
+ * GetShardCopyData finds existing connections for a shard in the
+ * provided hash. If not found, then a ShardCopyData structure with empty
+ * data and placementList is returned.
+ */
 static ShardCopyData *
 GetShardCopyData(HTAB *shardCopyDataHash, int64 shardId)
 {
@@ -3136,6 +3147,10 @@ GetShardCopyData(HTAB *shardCopyDataHash, int64 shardId)
 	return shardCopyData;
 }
 
+
+/*
+ * ShardCopyDataList returns the list of ShardCopyDatas in shardCopyDataHash.
+ */
 static List *
 ShardCopyDataList(HTAB *shardCopyDataHash)
 {
